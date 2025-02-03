@@ -11,9 +11,11 @@ import org.testcontainers.couchbase.CouchbaseContainer;
 import org.testcontainers.utility.DockerImageName;
 import reactor.core.Disposable;
 import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -114,6 +116,25 @@ public class CouchBaseTest {
           // latency issues when accessing Capella from a different Wide Area Network
           // or Availability Zone (e.g. your laptop).
           env.applyProfile("wan-development");
+          env.publishOnScheduler(() -> {
+            Context context = Vertx.currentContext();
+            Scheduler scheduler = Schedulers.fromExecutor(new Executor() {
+                @Override
+                public void execute(Runnable command) {
+                    context.runOnContext(new Handler<Void>() {
+
+                      @Override
+                      public void handle(Void event) {
+                        command.run();
+                      }
+                      
+                    });
+                }
+                
+            });
+            
+            return scheduler;
+        });
         })
       );
       server = vertx.createHttpServer().requestHandler(this::handle);
