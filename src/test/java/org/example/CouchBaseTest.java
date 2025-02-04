@@ -19,7 +19,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.*;
 
 public class CouchBaseTest {
 
@@ -84,7 +84,9 @@ public class CouchBaseTest {
 
   @Test
   public void testVertx() throws Exception {
-    vertx.deployVerticle(new App())
+    App app = new App();
+
+    vertx.deployVerticle(app)
       .toCompletionStage()
       .toCompletableFuture()
       .get(10, TimeUnit.SECONDS);
@@ -100,15 +102,24 @@ public class CouchBaseTest {
       .toCompletableFuture()
       .get(10, TimeUnit.SECONDS);
     assertEquals("{\"$1\":7}", body.toString());
+
+    assertNotNull(app.verticleThread);
+    assertSame(app.completionThread, app.resultThread);
+    assertSame(app.completionThread, app.verticleThread);
   }
 
   private class App extends AbstractVerticle {
 
     private ReactiveCluster cluster;
     private HttpServer server;
+    volatile Thread resultThread;
+    volatile Thread errorThread;
+    volatile Thread completionThread;
+    volatile Thread verticleThread;
 
     @Override
-    public void start(Promise<Void> startPromise) throws Exception {
+    public void start(Promise<Void> startPromise) {
+      verticleThread = Thread.currentThread();
       cluster = ReactiveCluster.connect(
         SERVER.getConnectionString(),
         ClusterOptions.clusterOptions(SERVER.getUsername(), SERVER.getPassword()).environment(env -> {
@@ -116,24 +127,11 @@ public class CouchBaseTest {
           // latency issues when accessing Capella from a different Wide Area Network
           // or Availability Zone (e.g. your laptop).
           env.applyProfile("wan-development");
+
+          // These are the line that matters and integrate the client with Vert.x model
           env.publishOnScheduler(() -> {
             Context context = Vertx.currentContext();
-            Scheduler scheduler = Schedulers.fromExecutor(new Executor() {
-                @Override
-                public void execute(Runnable command) {
-                    context.runOnContext(new Handler<Void>() {
-
-                      @Override
-                      public void handle(Void event) {
-                        command.run();
-                      }
-                      
-                    });
-                }
-                
-            });
-            
-            return scheduler;
+            return Schedulers.fromExecutor(command -> context.runOnContext(event -> command.run()));
         });
         })
       );
@@ -148,100 +146,18 @@ public class CouchBaseTest {
       HttpServerResponse response = request.response().setChunked(true);
       cluster.query("SELECT 2+5 FROM system:dual")
         .flatMapMany(result -> result.rowsAs(JsonObject.class))
-        .publishOn(scheduler(vertx.getOrCreateContext()))
         .subscribe(
           result -> {
-            System.out.println("Result on: " + Thread.currentThread());
+            resultThread = Thread.currentThread();
             response.write(result.toString());
           }, err -> {
-            System.out.println("Error on : " + Thread.currentThread());
-            err.printStackTrace(System.out);
+            errorThread = Thread.currentThread();
             response.setStatusCode(500).end();
           }, () -> {
-            System.out.println("End response on : " + Thread.currentThread());
+            completionThread = Thread.currentThread();
             response.end();
           }
         );
-    }
-  }
-
-  /**
-   * Scheduler that execute tasks on the vertx context thread (which can be an io event-loop thread, a worker thread
-   * or a virtual thread depending on the threading model of the app.
-   *
-   * This scheduler shall be used for publishing results of a client interaction.
-   *
-   * This scheduler depends on the current execution thread (hence the {@code context} parameter) and thus cannot
-   * be statically set on the client. Hence,  it needs to be created and set for every interaction that publishes
-   * a result.
-   *
-   * A factory like could be used to avoid this, e.g.
-   *
-   * cluster.setHook(new Supplier<Scheduler>() {
-   *   Context current = vertx.getOrCreateContext();
-   *   return scheduler(current);
-   * });
-   *
-   * When cluster.query(...).subscribe(...) is called, the hook would be called to get the scheduler to publish
-   * on for every call.
-   */
-  static Scheduler scheduler(Context context) {
-    return new Scheduler() {
-      @Override
-      public Disposable schedule(Runnable r) {
-        ContextTask task = new ContextTask(r);
-        context.runOnContext(task);
-        return task;
-      }
-
-      @Override
-      public Worker createWorker() {
-        return new Worker() {
-          @Override
-          public Disposable schedule(Runnable r) {
-            ContextTask task = new ContextTask(r);
-            context.runOnContext(task);
-            return task;
-          }
-
-          @Override
-          public void dispose() {
-          }
-        };
-      }
-    };
-  }
-
-  static final class ContextTask extends AtomicBoolean implements Handler<Void>, Disposable {
-
-    private final Runnable task;
-
-    ContextTask(Runnable task) {
-      this.task = task;
-    }
-
-    @Override
-    public void handle(Void event) {
-      if (!get()) {
-        System.out.println("EXECUTING TASK");
-        try {
-          task.run();
-          System.out.println("EXECUTED TASK");
-        }
-        finally {
-          lazySet(true);
-        }
-      }
-    }
-
-    @Override
-    public boolean isDisposed() {
-      return get();
-    }
-
-    @Override
-    public void dispose() {
-      set(true);
     }
   }
 }
